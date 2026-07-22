@@ -19,7 +19,7 @@ class Config:
     # LLM (OpenRouter)
     openrouter_api_key: str
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    model: str = "openai/gpt-3.5-turbo"
+    model: str = "gpt-4o-mini"
     max_tokens: int = 1500
     temperature: float = 0.7
     request_timeout: int = 30
@@ -37,7 +37,7 @@ class Config:
     def from_env(cls) -> "Config":
         return cls(
             bot_token=_require("BOT_TOKEN"),
-            webhook_url=os.getenv("WEBHOOK_URL"),
+            webhook_url=os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL"),
             webhook_secret=os.getenv("WEBHOOK_SECRET"),
             webhook_path=os.getenv("WEBHOOK_PATH", "/webhook"),
             port=int(os.getenv("PORT", "8080")),

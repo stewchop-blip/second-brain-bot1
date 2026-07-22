@@ -1,13 +1,14 @@
 """
 Main entry point for Second Brain Bot.
-Supports both webhook (production) and polling (local dev).
+Web Service mode: aiohttp server with /webhook (Telegram) and /health (Render).
 """
 import os
 import logging
 import asyncio
-from contextlib import asynccontextmanager
 
-from telegram.ext import Application, ApplicationBuilder
+from aiohttp import web
+from telegram import Update
+from telegram.ext import ApplicationBuilder
 
 from config import get_config
 from db import init_db, close_pool
@@ -19,75 +20,70 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+config = get_config()
 
-@asynccontextmanager
-async def lifespan(app: Application):
-    """Manage application lifecycle."""
+
+async def main() -> None:
     # Initialize database
     logger.info("Initializing database...")
     await init_db()
     logger.info("Database ready")
-    
-    yield
-    
-    # Cleanup
-    logger.info("Closing database pool...")
-    await close_pool()
-    logger.info("Shutdown complete")
 
+    # Build Telegram application
+    app = ApplicationBuilder().token(config.bot_token).build()
+    app.add_handler(get_conversation_handler())
+    app.add_error_handler(error_handler)
+    await app.initialize()
+    await app.start()
 
-async def run_polling(app: Application) -> None:
-    """Run bot in polling mode (local dev)."""
-    logger.info("Starting bot in polling mode...")
-    await app.run_polling()
-
-
-async def run_webhook(app: Application, config) -> None:
-    """Run bot in webhook mode (production)."""
+    # Determine webhook URL (Render provides RENDER_EXTERNAL_URL automatically)
     webhook_url = config.webhook_url
     if not webhook_url:
-        raise RuntimeError("WEBHOOK_URL must be set for webhook mode")
-    
-    webhook_secret = config.webhook_secret or "default-secret"
-    
-    logger.info(f"Starting bot in webhook mode: {webhook_url}{config.webhook_path}")
-    
-    await app.run_webhook(
-        listen="0.0.0.0",
-        port=config.port,
-        url_path=config.webhook_path,
-        secret_token=webhook_secret,
-        webhook_url=f"{webhook_url}{config.webhook_path}",
-        drop_pending_updates=True,
-    )
+        logger.error("No webhook URL available (set WEBHOOK_URL or use Render's RENDER_EXTERNAL_URL).")
+        return
+    full_url = f"{webhook_url.rstrip('/')}{config.webhook_path}"
 
+    # --- HTTP handlers ---
+    async def handle_webhook(request: web.Request) -> web.Response:
+        try:
+            data = await request.json()
+        except Exception:
+            return web.Response(status=400)
+        update = Update.de_json(data, app.bot)
+        await app.process_update(update)
+        return web.Response()
 
-async def main() -> None:
-    """Main entry point."""
-    config = get_config()
-    
-    # Build application
-    app = (
-        ApplicationBuilder()
-        .token(config.bot_token)
-        .post_init([])  # We use lifespan instead
-        .build()
-    )
-    
-    # Add lifespan
-    app.post_init = lifespan
-    
-    # Add handlers
-    app.add_handler(get_conversation_handler())
-    
-    # Add error handler
-    app.add_error_handler(error_handler)
-    
-    # Run in appropriate mode
-    if config.webhook_url:
-        await run_webhook(app, config)
-    else:
-        await run_polling(app)
+    async def handle_health(request: web.Request) -> web.Response:
+        return web.Response(text="OK")
+
+    aio_app = web.Application()
+    aio_app.router.add_post(config.webhook_path, handle_webhook)
+    aio_app.router.add_get("/health", handle_health)
+
+    # Register webhook with Telegram
+    await app.bot.set_webhook(url=full_url, secret_token=config.webhook_secret)
+    logger.info(f"Webhook registered at: {full_url}")
+
+    # Start HTTP server
+    runner = web.AppRunner(aio_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", config.port)
+    await site.start()
+    logger.info(f"HTTP server listening on port {config.port}")
+
+    # Keep running
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        logger.info("Shutting down...")
+        await app.bot.delete_webhook()
+        await app.stop()
+        await app.shutdown()
+        await close_pool()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
