@@ -6,18 +6,18 @@ from functools import lru_cache
 
 @dataclass(frozen=True)
 class Config:
-    # Telegram
+    # Required (no defaults — must come first in dataclass)
     bot_token: str
+    database_url: str
+    openrouter_api_key: str
+
+    # Telegram
     webhook_url: str | None = None
     webhook_secret: str | None = None
     webhook_path: str = "/webhook"
     port: int = 8080
 
-    # Database
-    database_url: str
-
     # LLM (OpenRouter)
-    openrouter_api_key: str
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     model: str = "gpt-4o-mini"
     max_tokens: int = 1500
@@ -37,14 +37,14 @@ class Config:
     def from_env(cls) -> "Config":
         return cls(
             bot_token=_require("BOT_TOKEN"),
+            database_url=_require("DATABASE_URL"),
+            openrouter_api_key=_require("OPENROUTER_API_KEY"),
             webhook_url=os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL"),
             webhook_secret=os.getenv("WEBHOOK_SECRET"),
             webhook_path=os.getenv("WEBHOOK_PATH", "/webhook"),
             port=int(os.getenv("PORT", "8080")),
-            database_url=_require("DATABASE_URL"),
-            openrouter_api_key=_require("OPENROUTER_API_KEY"),
             openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-            model=os.getenv("MODEL", "openai/gpt-3.5-turbo"),
+            model=os.getenv("MODEL", "gpt-4o-mini"),
             max_tokens=int(os.getenv("MAX_TOKENS", "1500")),
             temperature=float(os.getenv("TEMPERATURE", "0.7")),
             request_timeout=int(os.getenv("REQUEST_TIMEOUT", "30")),
