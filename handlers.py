@@ -44,14 +44,14 @@ MODE_LABELS = {
 }
 
 MODE_HINTS = {
-    "check_idea": "Найду слабые места, риски и то, что можно упустить.",
-    "check_message": "Покажу, как ваше сообщение может воспринять другой человек.",
-    "help_choose": "Помогу сравнить варианты и принять решение.",
+    "check_idea": "Риски и слабые места",
+    "check_message": "Как воспримут другие",
+    "help_choose": "Сравню варианты",
 }
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Main menu — problem-first, with descriptions."""
+    """Main menu — problem-first, with short descriptions on a new line."""
     keyboard = [
         [
             InlineKeyboardButton(
