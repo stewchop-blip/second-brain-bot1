@@ -1,8 +1,7 @@
 """
-Telegram bot handlers with FSM for 3 modes:
-- challenge (Оспорить)
-- message_check (Проверить сообщение)
-- choose (Помочь выбрать)
+Telegram bot handlers.
+Rewritten UX: problem-first language, no "режим" word, no "AI" word,
+examples, friendly intros, quick-action buttons after each answer.
 """
 import logging
 from typing import Optional
@@ -26,246 +25,264 @@ from db import (
     get_remaining,
     save_conversation,
     get_recent_conversations,
+    get_user_stats,
 )
-from llm_client import LLMClient, Mode
-from prompts import get_mode, list_modes
+from llm_client import LLMClient
+from prompts import get_mode
 
 logger = logging.getLogger(__name__)
 
 # Conversation states
-SELECTING_MODE, CHALLENGE_INPUT, MESSAGE_CHECK_INPUT, CHOOSE_INPUT = range(4)
+SELECTING, IDEA_INPUT, MESSAGE_INPUT, CHOOSE_INPUT = range(4)
 
 config = get_config()
 
+MODE_LABELS = {
+    "check_idea": "💡 Проверить идею",
+    "check_message": "💬 Проверить сообщение",
+    "help_choose": "🤔 Помочь с выбором",
+}
+
+MODE_HINTS = {
+    "check_idea": "Найду слабые места, риски и то, что можно упустить.",
+    "check_message": "Покажу, как ваше сообщение может воспринять другой человек.",
+    "help_choose": "Помогу сравнить варианты и принять решение.",
+}
+
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Main menu inline keyboard."""
+    """Main menu — problem-first, with descriptions."""
     keyboard = [
         [
-            InlineKeyboardButton("💥 Оспорить идею", callback_data="mode:challenge"),
-            InlineKeyboardButton("✉️ Проверить сообщение", callback_data="mode:message_check"),
+            InlineKeyboardButton(
+                f"{MODE_LABELS['check_idea']}\n{MODE_HINTS['check_idea']}",
+                callback_data="m:check_idea",
+            )
         ],
         [
-            InlineKeyboardButton("⚖️ Помочь выбрать", callback_data="mode:choose"),
+            InlineKeyboardButton(
+                f"{MODE_LABELS['check_message']}\n{MODE_HINTS['check_message']}",
+                callback_data="m:check_message",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"{MODE_LABELS['help_choose']}\n{MODE_HINTS['help_choose']}",
+                callback_data="m:help_choose",
+            )
         ],
         [
             InlineKeyboardButton("📊 Статистика", callback_data="stats"),
-            InlineKeyboardButton("ℹ️ Помощь", callback_data="help"),
+            InlineKeyboardButton("ℹ️ Как пользоваться", callback_data="help"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
 def back_keyboard() -> InlineKeyboardMarkup:
-    """Back to menu keyboard."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("« Назад в меню", callback_data="menu")],
+        [InlineKeyboardButton("⬅️ Главное меню", callback_data="menu")],
     ])
 
 
+def after_answer_keyboard() -> InlineKeyboardMarkup:
+    """Quick actions after each answer."""
+    keyboard = [
+        [
+            InlineKeyboardButton("🔄 Проверить ещё", callback_data="menu"),
+            InlineKeyboardButton("✏️ Исправить ответ", callback_data="menu"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Главное меню", callback_data="menu"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entry point - show main menu."""
+    """Entry point — clear, problem-first welcome."""
     user = update.effective_user
     await get_or_create_user(user.id, user.username, user.first_name)
-    
+
     text = (
         f"👋 Привет, {user.first_name}!\n\n"
-        "Я — твой **Второй мозг**. Помогаю быстро принимать решения:\n\n"
-        "💥 **Оспорить** — найду риски и слабые места в твоей идее\n"
-        "✉️ **Проверить** — проанализирую тон, стиль, грамматику сообщения\n"
-        "⚖️ **Выбрать** — сравню варианты и дам обоснованную рекомендацию\n\n"
-        "Выбери режим:"
+        "Я — «Второй мозг». Помогаю перед важными шагами.\n\n"
+        "За минуту могу:\n"
+        "• проверить идею;\n"
+        "• проверить сообщение перед отправкой;\n"
+        "• помочь выбрать между вариантами.\n\n"
+        "Чем могу помочь?"
     )
-    
+
     if update.message:
-        await update.message.reply_text(text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
+        await update.message.reply_text(text, reply_markup=main_menu_keyboard())
     elif update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
-    
-    return SELECTING_MODE
+        await update.callback_query.edit_message_text(text, reply_markup=main_menu_keyboard())
+
+    return SELECTING
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Show help."""
+    """How to use — simple."""
     text = (
         "📖 **Как пользоваться**\n\n"
-        "**💥 Оспорить идею** — опиши идею или план одним сообщением. "
-        "Бот выступит в роли дьявола-адвоката: найдёт риски, слабые места, "
-        "предложит как проверить гипотезу дёшево.\n\n"
-        "**✉️ Проверить сообщение** — пришли текст, который хочешь отправить. "
-        "Бот проанализирует тон, найдёт резкие места, ошибки, и даст улучшенную версию.\n\n"
-        "**⚖️ Помочь выбрать** — опиши ситуацию с вариантами через «или». "
-        "Например: *«Нанять джуниора за 80к или сеньора за 180к?»* "
-        "Бот сравнит по критериям и даст рекомендацию.\n\n"
+        "**💡 Проверить идею** — расскажи свою идею одним сообщением. "
+        "Я найду риски, слабые места и скажу, как проверить дёшево.\n\n"
+        "**💬 Проверить сообщение** — вставь текст, который хочешь отправить. "
+        "Я покажу, как его воспримет другой человек, и дам улучшенную версию.\n\n"
+        "**🤔 Помочь с выбором** — напиши варианты через «или». "
+        "Например: *«Нанять джуниора или сеньора?»* "
+        "Я сравню и дам совет.\n\n"
         f"📊 Лимит: {config.daily_limit} запросов в сутки\n"
-        f"📝 Макс. длина сообщения: {config.max_message_length} символов"
+        f"📝 Макс. длина: {config.max_message_length} символов"
     )
-    
+
     if update.message:
         await update.message.reply_text(text, reply_markup=back_keyboard(), parse_mode="Markdown")
     elif update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=back_keyboard(), parse_mode="Markdown")
-    
-    return SELECTING_MODE
+
+    return SELECTING
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Show user statistics."""
-    from db import get_user_stats
+    """User statistics."""
     user = update.effective_user
     stats = await get_user_stats(user.id)
-    
+
     text = (
         f"📊 **Твоя статистика**\n\n"
-        f"👤 Зарегистрирован: {stats['first_seen'][:10] if stats['first_seen'] else '—'}\n"
+        f"👤 С нами с: {stats['first_seen'][:10] if stats['first_seen'] else '—'}\n"
         f"📝 Всего запросов: {stats['requests_total']}\n"
-        f"📅 Сегодня использовано: {stats['used_today']}/{config.daily_limit}\n"
-        f"💬 Всего диалогов: {stats['total_conversations']}\n\n"
+        f"📅 Сегодня: {stats['used_today']}/{config.daily_limit}\n"
+        f"💬 Диалогов: {stats['total_conversations']}\n\n"
         f"Осталось сегодня: **{config.daily_limit - stats['used_today']}**"
     )
-    
+
     if update.message:
         await update.message.reply_text(text, reply_markup=back_keyboard(), parse_mode="Markdown")
     elif update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=back_keyboard(), parse_mode="Markdown")
-    
-    return SELECTING_MODE
+
+    return SELECTING
 
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle 'back to menu' callback."""
+    """Back to menu."""
     query = update.callback_query
     await query.answer()
     return await start(update, context)
 
 
 async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle mode selection."""
+    """Mode selection — friendly prompt with examples."""
     query = update.callback_query
     await query.answer()
-    
+
     user_id = query.from_user.id
     mode_key = query.data.split(":")[1]
-    
-    # Check daily limit
+
     if not await check_limit(user_id, config.daily_limit):
         remaining = await get_remaining(user_id, config.daily_limit)
         await query.edit_message_text(
-            f"⛔ **Лимит исчерпан**\n\n"
-            f"Ты использовал все {config.daily_limit} запросов на сегодня.\n"
-            f"Попробуй завтра! 🌅\n\n"
+            f"⛔ **Лимит на сегодня исчерпан**\n\n"
+            f"Ты использовал все {config.daily_limit} запросов.\n"
+            f"Возвращайся завтра! 🌅\n\n"
             f"Осталось: {remaining}",
             reply_markup=back_keyboard(),
-            parse_mode="Markdown"
+            parse_mode="Markdown",
         )
-        return SELECTING_MODE
-    
-    # Store mode in context
+        return SELECTING
+
     context.user_data["mode"] = mode_key
-    
-    # Get mode info
-    mode = get_mode(mode_key)
-    
-    prompt_text = {
-        "challenge": (
-            "💥 **Оспорить идею**\n\n"
-            "Опиши свою идею, план или гипотезу одним сообщением.\n"
-            "Я найду риски, слабые места и скажу, как проверить дёшево.\n\n"
-            "*Пример: «Хочу открыть кофейню в спальном районе — только тейк-ауф, никакого зала»*"
+
+    prompts = {
+        "check_idea": (
+            "💡 **Проверить идею**\n\n"
+            "Расскажи свою идею одним сообщением — я найду риски и слабые места.\n\n"
+            "*Например:*\n"
+            "• «Хочу открыть кофейню»\n"
+            "• «Стоит ли менять работу?»\n"
+            "• «Запустить канал про ремонт?»"
         ),
-        "message_check": (
-            "✉️ **Проверить сообщение**\n\n"
-            "Пришли текст, который хочешь проверить перед отправкой.\n"
-            "Я проанализирую тон, стиль, грамматику и дам улучшенную версию.\n\n"
-            "*Пример: «Иван, вы опять опоздали. Если повторится — уволю.»*"
+        "check_message": (
+            "💬 **Проверить сообщение**\n\n"
+            "Вставь сообщение, которое хочешь отправить — покажу, как его воспримут.\n\n"
+            "*Например:*\n"
+            "• «Привет. Хотел уточнить про встречу»\n"
+            "• «Спасибо за предложение, но я подумаю»"
         ),
-        "choose": (
-            "⚖️ **Помочь выбрать**\n\n"
-            "Опиши ситуацию и варианты через «или».\n"
-            "Я выделю критерии, сравню плюсы/минусы и дам рекомендацию.\n\n"
-            "*Пример: «Нанять джуниора за 80к и учить, или сеньора за 180к — сразу в дело?»*"
+        "help_choose": (
+            "🤔 **Помочь с выбором**\n\n"
+            "Напиши варианты, между которыми выбираешь.\n\n"
+            "*Например:*\n"
+            "• «Покупать эту машину или брать в лизинг?»\n"
+            "• «Остаться в офисе или на удалёнке?»"
         ),
     }
-    
+
     await query.edit_message_text(
-        prompt_text[mode_key],
+        prompts[mode_key],
         reply_markup=back_keyboard(),
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
-    
-    # Return appropriate state
+
     state_map = {
-        "challenge": CHALLENGE_INPUT,
-        "message_check": MESSAGE_CHECK_INPUT,
-        "choose": CHOOSE_INPUT,
+        "check_idea": IDEA_INPUT,
+        "check_message": MESSAGE_INPUT,
+        "help_choose": CHOOSE_INPUT,
     }
     return state_map[mode_key]
 
 
-async def handle_challenge_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle user input for challenge mode."""
-    return await _process_mode_input(update, context, "challenge")
+async def handle_idea(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _process_input(update, context, "check_idea", "💡 Отличная идея. Давай проверим.")
 
 
-async def handle_message_check_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle user input for message check mode."""
-    return await _process_mode_input(update, context, "message_check")
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _process_input(update, context, "check_message", "💬 Посмотрим, как это воспримут.")
 
 
-async def handle_choose_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle user input for choose mode."""
-    return await _process_mode_input(update, context, "choose")
+async def handle_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _process_input(update, context, "help_choose", "🤔 Разберём вместе.")
 
 
-async def _process_mode_input(
+async def _process_input(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    mode_key: str
+    mode_key: str,
+    intro: str,
 ) -> int:
-    """Process user input for a specific mode."""
+    """Shared processing for all three modes."""
     user = update.effective_user
     user_id = user.id
     text = update.message.text.strip()
-    
-    # Validate length
+
     if len(text) > config.max_message_length:
         await update.message.reply_text(
-            f"⚠️ Слишком длинное сообщение. Максимум {config.max_message_length} символов.\n"
+            f"⚠️ Слишком длинно. Максимум {config.max_message_length} символов.\n"
             f"У тебя: {len(text)}. Сократи и попробуй снова.",
-            reply_markup=back_keyboard()
+            reply_markup=back_keyboard(),
         )
-        # Stay in same state
-        state_map = {
-            "challenge": CHALLENGE_INPUT,
-            "message_check": MESSAGE_CHECK_INPUT,
-            "choose": CHOOSE_INPUT,
-        }
+        state_map = {"check_idea": IDEA_INPUT, "check_message": MESSAGE_INPUT, "help_choose": CHOOSE_INPUT}
         return state_map[mode_key]
-    
-    # Show thinking indicator
-    thinking = await update.message.reply_text("🧠 Думаю...")
-    
+
+    thinking = await update.message.reply_text(f"🧠 {intro}")
+
     try:
-        # Get mode and system prompt
         mode = get_mode(mode_key)
-        system_prompt = mode.prompt
-        
-        # Get conversation history for context
         history = await get_recent_conversations(user_id, config.history_limit)
-        
-        # Call LLM
+
         async with LLMClient() as client:
             response = await client.complete(
-                system_prompt=system_prompt,
+                system_prompt=mode.prompt,
                 user_message=text,
                 history=history,
             )
-        
-        # Save usage
+
         await increment_usage(user_id)
         remaining = await get_remaining(user_id, config.daily_limit)
-        
-        # Save conversation
+
         await save_conversation(
             user_id=user_id,
             mode=mode_key,
@@ -273,81 +290,73 @@ async def _process_mode_input(
             bot_response=response.content,
             tokens_used=response.tokens_used,
         )
-        
-        # Delete thinking message
+
         await thinking.delete()
-        
-        # Send response
+
         await update.message.reply_text(
             f"{response.content}\n\n"
             f"—\n"
-            f"📊 Осталось сегодня: **{remaining}** запросов\n"
-            f"🔢 Токенов использовано: {response.tokens_used}",
-            reply_markup=main_menu_keyboard(),
-            parse_mode="Markdown"
+            f"📊 Осталось сегодня: **{remaining}** запросов",
+            reply_markup=after_answer_keyboard(),
+            parse_mode="Markdown",
         )
-        
+
     except Exception as e:
         logger.exception(f"Error processing {mode_key} for user {user_id}")
         await thinking.delete()
         await update.message.reply_text(
-            f"⚠️ Произошла ошибка: {str(e)[:200]}\n"
-            f"Попробуй ещё раз или выбери другой режим.",
-            reply_markup=main_menu_keyboard()
+            f"⚠️ Что-то пошло не так: {str(e)[:200]}\nПопробуй ещё раз или вернись в меню.",
+            reply_markup=main_menu_keyboard(),
         )
-    
-    return SELECTING_MODE
+
+    return SELECTING
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel current operation."""
-    await update.message.reply_text(
-        "Отменено. Выбери режим:",
-        reply_markup=main_menu_keyboard()
-    )
-    return SELECTING_MODE
+    """Cancel."""
+    await update.message.reply_text("Ок, вернулись в меню.", reply_markup=main_menu_keyboard())
+    return SELECTING
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Global error handler."""
     logger.exception("Unhandled error", exc_info=context.error)
-    
     if isinstance(update, Update) and update.effective_message:
         await update.effective_message.reply_text(
-            "⚠️ Произошла непредвиденная ошибка. Попробуй ещё раз или /start",
-            reply_markup=main_menu_keyboard()
+            "⚠️ Что-то пошло не так. Попробуй ещё раз или /start",
+            reply_markup=main_menu_keyboard(),
         )
 
 
 def get_conversation_handler() -> ConversationHandler:
-    """Build and return the main ConversationHandler."""
+    """Build main ConversationHandler."""
     return ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
             CommandHandler("help", help_command),
             CommandHandler("stats", stats_command),
-            CallbackQueryHandler(mode_callback, pattern=r"^mode:"),
+            CallbackQueryHandler(mode_callback, pattern=r"^m:"),
             CallbackQueryHandler(menu_callback, pattern=r"^menu$"),
             CallbackQueryHandler(help_command, pattern=r"^help$"),
             CallbackQueryHandler(stats_command, pattern=r"^stats$"),
         ],
         states={
-            SELECTING_MODE: [
-                CallbackQueryHandler(mode_callback, pattern=r"^mode:"),
+            SELECTING: [
+                CallbackQueryHandler(mode_callback, pattern=r"^m:"),
                 CallbackQueryHandler(menu_callback, pattern=r"^menu$"),
                 CallbackQueryHandler(help_command, pattern=r"^help$"),
                 CallbackQueryHandler(stats_command, pattern=r"^stats$"),
             ],
-            CHALLENGE_INPUT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_challenge_input),
+            IDEA_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_idea),
                 CommandHandler("cancel", cancel),
             ],
-            MESSAGE_CHECK_INPUT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_check_input),
+            MESSAGE_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message),
                 CommandHandler("cancel", cancel),
             ],
             CHOOSE_INPUT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_choose_input),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_choose),
                 CommandHandler("cancel", cancel),
             ],
         },
