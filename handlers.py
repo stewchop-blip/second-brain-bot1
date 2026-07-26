@@ -118,7 +118,7 @@ def route_keyboard(route_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Entry point — heading + problem-first question."""
     user = update.effective_user
     await get_or_create_user(user.id, user.username, user.first_name)
