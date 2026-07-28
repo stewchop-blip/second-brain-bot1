@@ -21,8 +21,8 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4o-mini")
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "1500"))
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.7"))
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "30.0"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "25.0"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
 
 
 class Mode(str, Enum):

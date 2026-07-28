@@ -203,6 +203,27 @@ async def get_recent_conversations(user_id: int, limit: int = 10) -> List[Dict[s
         return [dict(row) for row in reversed(rows)]  # Chronological order
 
 
+async def get_user_topics(user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    """Get a simple list of recent conversation first-messages (for history view)."""
+    async with acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, user_message, created_at
+            FROM conversations
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+        """, user_id, limit * 2)
+        # Deduplicate by keeping the first message of each contiguous session
+        seen = []
+        for r in rows:
+            msg = r["user_message"]
+            if not seen or seen[-1]["first_message"] != msg:
+                seen.append({"id": r["id"], "first_message": msg, "created_at": r["created_at"]})
+            if len(seen) >= limit:
+                break
+        return list(reversed(seen))
+
+
 async def get_user_stats(user_id: int) -> Dict[str, Any]:
     """Get user statistics."""
     async with acquire() as conn:
