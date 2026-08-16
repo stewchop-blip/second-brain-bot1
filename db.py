@@ -4,6 +4,7 @@ Tables: users, daily_usage, conversations (history), conversation_state,
 referrals, analytics_events.
 """
 import asyncpg
+import json
 import os
 import secrets
 from datetime import date, datetime, timedelta
@@ -17,10 +18,23 @@ if not DATABASE_URL:
 _pool: Optional[asyncpg.Pool] = None
 
 
+async def _init_connection(conn: asyncpg.Connection) -> None:
+    # Register JSONB codec so asyncpg auto-encodes/decodes Python objects
+    await conn.set_type_codec(
+        "jsonb",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
+
+
 async def init_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
-        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10, command_timeout=30)
+        _pool = await asyncpg.create_pool(
+            DATABASE_URL, min_size=1, max_size=10,
+            command_timeout=30, init=_init_connection,
+        )
     return _pool
 
 
