@@ -16,6 +16,7 @@ class Config:
     webhook_secret: str | None = None
     webhook_path: str = "/webhook"
     port: int = 8080
+    bot_username: str | None = None
 
     # LLM (OpenRouter)
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
@@ -43,6 +44,7 @@ class Config:
             webhook_secret=os.getenv("WEBHOOK_SECRET"),
             webhook_path=os.getenv("WEBHOOK_PATH", "/webhook"),
             port=int(os.getenv("PORT", "8080")),
+            bot_username=os.getenv("BOT_USERNAME"),
             openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
             model=os.getenv("MODEL", "gpt-4o-mini"),
             max_tokens=int(os.getenv("MAX_TOKENS", "1500")),

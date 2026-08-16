@@ -1,7 +1,7 @@
 """
-Telegram bot handlers.
-"Спросить" is the main universal chat. Specialized modes are optional add-ons.
-Context is kept per-conversation in user_data; history is listed from DB.
+Telegram handlers for Second Brain Bot 1.5.
+Single-chat core: user writes -> one AI call returns JSON -> bot replies.
+No mode buttons in the user path. Only 🆕 Новая тема.
 """
 import logging
 import asyncio
@@ -9,595 +9,334 @@ from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
+    ContextTypes, filters,
 )
 
 from config import get_config
 from db import (
-    get_or_create_user,
-    check_limit,
-    increment_usage,
-    get_remaining,
-    save_conversation,
-    get_recent_conversations,
-    get_user_topics,
+    get_or_create_user, daily_remaining, bonus_balance, can_make_request,
+    increment_daily, increment_total, consume_bonus, get_conversation_state,
+    save_context, clear_context, set_awaiting_clarification, record_successful_request_for_referral,
+    save_conversation, get_recent_conversations, get_referral_token, get_user,
 )
 from llm_client import LLMClient, ModelError, RateLimitError
-from prompts import get_mode
+from analytics import analytics
 
 logger = logging.getLogger(__name__)
 
-# Conversation states
-SELECTING, ASK_INPUT, IDEA_INPUT, MESSAGE_INPUT, CHOOSE_INPUT = range(5)
-
 config = get_config()
-
-MODE_LABELS = {
-    "check_idea": "💡 Проверить идею",
-    "check_message": "✉️ Проверить сообщение",
-    "help_choose": "⚖️ Помочь выбрать",
-}
+DAILY_LIMIT = config.daily_limit  # 10 per spec
+BOT_USERNAME = config.bot_username if hasattr(config, "bot_username") else None
 
 
+# ---------- Keyboards ----------
 def main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Main menu — 'Спросить' is the primary action, others secondary."""
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "❓ Спросить\nЗадайте любой вопрос или опишите ситуацию.",
-                callback_data="m:ask",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "✉️ Проверить сообщение\nПроверьте текст перед отправкой.",
-                callback_data="m:check_message",
-            )
-        ],
-        [
-            InlineKeyboardButton("📂 Ещё возможности", callback_data="more"),
-        ],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def more_keyboard() -> InlineKeyboardMarkup:
-    """Secondary menu — specialized modes + history."""
-    keyboard = [
-        [
-            InlineKeyboardButton("💡 Проверить идею\nНайдём слабые места и риски.", callback_data="m:check_idea"),
-        ],
-        [
-            InlineKeyboardButton("⚖️ Помочь выбрать\nСравним варианты и разберёмся, что выбрать.", callback_data="m:help_choose"),
-        ],
-        [
-            InlineKeyboardButton("🕘 История", callback_data="history"),
-            InlineKeyboardButton("⬅️ Назад", callback_data="menu"),
-        ],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Главное меню", callback_data="menu")],
+        [InlineKeyboardButton("✨ Что можно спросить?", callback_data="what")],
+        [InlineKeyboardButton("🎁 Бонусные вопросы", callback_data="bonus")],
+        [InlineKeyboardButton("❓ Помощь", callback_data="help")],
     ])
 
 
-def ask_followup_keyboard() -> InlineKeyboardMarkup:
-    """After an 'ask' answer — continue, deeper, new, menu."""
+def new_topic_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("💬 Продолжить", callback_data="continue"),
-            InlineKeyboardButton("🔎 Подробнее", callback_data="deeper"),
-        ],
-        [
-            InlineKeyboardButton("🆕 Новый вопрос", callback_data="new"),
-            InlineKeyboardButton("⬅️ Главное меню", callback_data="menu"),
-        ],
+        [InlineKeyboardButton("✨ Что можно спросить?", callback_data="what")],
+        [InlineKeyboardButton("🎁 Бонусные вопросы", callback_data="bonus")],
+        [InlineKeyboardButton("❓ Помощь", callback_data="help")],
     ])
 
 
-def ask_route_keyboard() -> InlineKeyboardMarkup:
-    """Optional specialized check on the same text (not forced)."""
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("💡 Проверить идею", callback_data="route:check_idea"),
-        ],
-        [
-            InlineKeyboardButton("✉️ Проверить сообщение", callback_data="route:check_message"),
-        ],
-        [
-            InlineKeyboardButton("⚖️ Помочь выбрать", callback_data="route:help_choose"),
-        ],
-        [
-            InlineKeyboardButton("✅ Просто ответить", callback_data="continue"),
-        ],
-    ])
+def no_keyboard() -> None:
+    return None
 
 
-def specialized_followup_keyboard() -> InlineKeyboardMarkup:
-    """After a specialized answer — continue in same mode, new, menu."""
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("💬 Продолжить", callback_data="continue"),
-            InlineKeyboardButton("🔎 Подробнее", callback_data="deeper"),
-        ],
-        [
-            InlineKeyboardButton("🆕 Новый вопрос", callback_data="new"),
-            InlineKeyboardButton("⬅️ Главное меню", callback_data="menu"),
-        ],
-    ])
+# ---------- Helpers ----------
+async def safe_edit(query, text, reply_markup=None, parse_mode=None):
+    try:
+        await query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except Exception as e:
+        logger.debug(f"edit failed: {e}")
+        try:
+            await query.message.reply_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+        except Exception:
+            pass
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entry point — heading + primary question."""
+# ---------- Start ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    await get_or_create_user(user.id, user.username, user.first_name)
+    # Deep link /start=<payload>
+    payload = None
+    if context.args:
+        payload = context.args[0]
+        if payload.startswith("ref_"):
+            payload = payload  # store as source_param
+    await get_or_create_user(user.id, user.username, user.first_name, source_param=payload)
 
-    # Reset conversation context on fresh start
-    context.user_data["conv"] = []
-    context.user_data["pending_text"] = None
-    context.user_data["active_mode"] = None
+    # Reset context on /start
+    await clear_context(user.id)
+    await set_awaiting_clarification(user.id, False)
+
+    await analytics.track("user_started", user.id, {"source_param": payload, "is_new": True})
 
     text = (
         "🧠 **Второй мозг**\n\n"
-        "Просто напишите вопрос или расскажите, с чем нужно разобраться.\n\n"
-        "**Что нужно сделать?**"
+        "Помогу разобраться, придумать, написать или принять решение.\n\n"
+        "Никаких сложных команд и выбора нейросетей — просто напиши, что тебе нужно.\n\n"
+        "Например:\n"
+        "• «Стоит ли менять работу?»\n"
+        "• «Как лучше ответить клиенту?»\n"
+        "• «Помоги выбрать между двумя ноутбуками»\n"
+        "• «Хочу открыть кофейню — разнеси идею по фактам»\n\n"
+        f"🎁 У тебя {DAILY_LIMIT} бесплатных запросов в день.\n\n"
+        "Что у тебя на уме?"
     )
-
     if update.message:
         await update.message.reply_text(text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
     elif update.callback_query:
-        await safe_edit(update.callback_query, text, main_menu_keyboard())
-
-    return SELECTING
+        await safe_edit(update.callback_query, text, main_menu_keyboard(), "Markdown")
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """How to use — simple."""
+# ---------- Menu ----------
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "📖 **Как пользоваться**\n\n"
-        "**❓ Спросить** — напиши любой вопрос обычными словами. Я отвечу и запомню контекст, "
-        "чтобы можно было уточнять и продолжать тему.\n\n"
-        "**✉️ Проверить сообщение** — вставь текст для отправки, я покажу, как его воспримут, и дам улучшенную версию.\n\n"
-        "**💡 Проверить идею** — расскажи идею, найду риски и слабые места.\n\n"
-        "**⚖️ Помочь выбрать** — напиши варианты через «или».\n\n"
-        "После ответа нажми **💬 Продолжить**, **🔎 Подробнее** или **🆕 Новый вопрос**.\n\n"
-        f"📝 Макс. длина: {config.max_message_length} символов"
+        "🧠 **Второй мозг**\n\n"
+        "Просто напиши мне задачу — режим выбирать не нужно."
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🆕 Новая тема", callback_data="new")],
+        [InlineKeyboardButton("✨ Что можно спросить?", callback_data="what")],
+        [InlineKeyboardButton("🎁 Бонусные вопросы", callback_data="bonus")],
+        [InlineKeyboardButton("❓ Помощь", callback_data="help")],
+    ])
+    if update.message:
+        await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
+    elif update.callback_query:
+        await safe_edit(update.callback_query, text, kb, "Markdown")
+
+
+# ---------- New topic ----------
+async def new_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    await clear_context(user_id)
+    await set_awaiting_clarification(user_id, False)
+    text = (
+        "🆕 Начали новую тему.\n\n"
+        "Предыдущий разговор больше не учитываю.\n\n"
+        "О чём поговорим теперь?"
     )
     if update.message:
-        await update.message.reply_text(text, reply_markup=back_keyboard(), parse_mode="Markdown")
+        await update.message.reply_text(text)
     elif update.callback_query:
-        await safe_edit(update.callback_query, text, back_keyboard())
-    return SELECTING
+        await safe_edit(update.callback_query, text)
 
 
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Back to menu from any state — stable."""
-    query = update.callback_query
-    await query.answer()
-    # Reset context when returning to menu
-    context.user_data["conv"] = []
-    context.user_data["pending_text"] = None
-    context.user_data["active_mode"] = None
-    await safe_edit(query, None, main_menu_keyboard(), menu_text=True)
-    return SELECTING
-
-
-async def more_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    await safe_edit(query, "**Ещё возможности:**", more_keyboard())
-    return SELECTING
-
-
-async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    try:
-        topics = await get_user_topics(user_id, limit=10)
-    except Exception as e:
-        logger.exception("history error")
-        topics = []
-    if not topics:
-        text = "🕘 **История**\n\nПока пусто. Задай вопрос — он появится здесь."
-    else:
-        lines = []
-        for t in topics:
-            label = t["first_message"][:40] + ("…" if len(t["first_message"]) > 40 else "")
-            lines.append(f"• {label}")
-        text = "🕘 **История**\n\n" + "\n".join(lines)
-    await safe_edit(query, text, back_keyboard())
-    return SELECTING
-
-
-async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Mode selection — friendly prompt with examples."""
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    mode_key = query.data.split(":")[1]
-
-    if not await check_limit(user_id, config.daily_limit):
-        remaining = await get_remaining(user_id, config.daily_limit)
-        await safe_edit(query,
-            f"⛔ **Лимит на сегодня исчерпан**\n\n"
-            f"Ты использовал все {config.daily_limit} запросов.\n"
-            f"Возвращайся завтра! 🌅\n\n"
-            f"Осталось: {remaining}",
-            back_keyboard())
-        return SELECTING
-
-    context.user_data["active_mode"] = mode_key
-    context.user_data["conv"] = []  # fresh context for this mode
-
-    prompts = {
-        "ask": (
-            "❓ **Спросить**\n\n"
-            "Напиши вопрос или расскажи ситуацию обычными словами.\n\n"
-            "*Например:*\n"
-            "• «Стоит ли менять работу?»\n"
-            "• «Как лучше ответить клиенту?»\n"
-            "• «Хочу открыть кофейню»"
-        ),
-        "check_idea": (
-            "💡 **Проверить идею**\n\n"
-            "Расскажи свою идею одним сообщением — я найду риски и слабые места.\n\n"
-            "*Например:*\n"
-            "• «Хочу открыть кофейню»\n"
-            "• «Стоит ли менять работу?»"
-        ),
-        "check_message": (
-            "✉️ **Проверить сообщение**\n\n"
-            "Вставь сообщение, которое хочешь отправить — покажу, как его воспримут.\n\n"
-            "*Например:*\n"
-            "• «Привет. Хотел уточнить про встречу»\n"
-            "• «Спасибо за предложение, но я подумаю»"
-        ),
-        "help_choose": (
-            "⚖️ **Помочь выбрать**\n\n"
-            "Напиши варианты, между которыми выбираешь.\n\n"
-            "*Например:*\n"
-            "• «Покупать эту машину или брать в лизинг?»\n"
-            "• «Остаться в офисе или на удалёнке?»"
-        ),
-    }
-
-    state_map = {
-        "ask": ASK_INPUT,
-        "check_idea": IDEA_INPUT,
-        "check_message": MESSAGE_INPUT,
-        "help_choose": CHOOSE_INPUT,
-    }
-
-    await safe_edit(query, prompts[mode_key], back_keyboard())
-    return state_map[mode_key]
-
-
-async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """User chose to run specialized mode on the text from 'Спросить' (optional, not forced)."""
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    target = query.data.split(":")[1]
-    saved_text = context.user_data.get("pending_text", "")
-    if not saved_text:
-        await safe_edit(query, "Текст не сохранился. Выбери действие и напиши заново.", back_keyboard())
-        return SELECTING
-    intro = {
-        "check_idea": "💡 Проверяю идею…",
-        "check_message": "✉️ Проверяю сообщение…",
-        "help_choose": "⚖️ Сравниваю варианты…",
-    }[target]
-    context.user_data["active_mode"] = target
-    await _process_input_text(user_id, saved_text, target, intro, context, query=query)
-    return SELECTING
-
-
-async def continue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Resume conversation — just prompt for next message in current mode."""
-    query = update.callback_query
-    await query.answer()
-    mode = context.user_data.get("active_mode", "ask")
-    hints = {
-        "ask": "Напиши следующий вопрос или уточнение — я помню контекст.",
-        "check_idea": "Расскажи ещё об идее или уточни детали.",
-        "check_message": "Вставь следующий текст для проверки.",
-        "help_choose": "Опиши варианты или добавь детали для сравнения.",
-    }
-    await safe_edit(query, hints.get(mode, "Напиши следующий вопрос."), back_keyboard())
-    return _state_for_mode(mode)
-
-
-async def deeper_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Ask AI to go deeper on the last answer."""
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    conv = context.user_data.get("conv", [])
-    if not conv:
-        await safe_edit(query, "Нет предыдущего ответа, чтобы углубиться. Задай вопрос.", back_keyboard())
-        return SELECTING
-    mode = context.user_data.get("active_mode", "ask")
-    await _process_input_text(
-        user_id,
-        "Пожалуйста, расскажи подробнее и глубже про то, что ты написал выше. Раскрой детали.",
-        mode,
-        "🔎 Углубляюсь…",
-        context,
-        query=query,
+# ---------- Help ----------
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "❓ **Как пользоваться Вторым мозгом**\n\n"
+        "Просто напиши вопрос или опиши ситуацию обычными словами.\n\n"
+        "Я сам пойму, нужно ли:\n"
+        "• ответить на вопрос;\n"
+        "• проверить сообщение;\n"
+        "• разобрать идею;\n"
+        "• помочь выбрать.\n\n"
+        "Чтобы начать разговор с чистого листа — нажми 🆕 Новая тема.\n\n"
+        "Сейчас бот работает только с текстом. Фото, файлы и голосовые пока не обрабатываются."
     )
-    return SELECTING
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🆕 Новая тема", callback_data="new")]])
+    if update.message:
+        await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
+    elif update.callback_query:
+        await safe_edit(update.callback_query, text, kb, "Markdown")
 
 
-async def new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start a new topic — clear context."""
+# ---------- What can I ask ----------
+async def what_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    context.user_data["conv"] = []
-    context.user_data["pending_text"] = None
-    context.user_data["active_mode"] = None
-    await safe_edit(query, "🆕 Новый вопрос. Контекст очищен — пиши с чистого листа.", main_menu_keyboard())
-    return SELECTING
+    text = (
+        "✨ **Что можно спросить?**\n\n"
+        "Практически любую текстовую задачу.\n\n"
+        "💬 Разобраться: «Почему я постоянно откладываю это дело?»\n"
+        "✍️ Проверить сообщение: «Вот что хочу написать начальнику. Нормально звучит?»\n"
+        "💡 Проверить идею: «Думаю открыть маленькую кофейню. Где слабые места?»\n"
+        "⚖️ Помочь выбрать: «Что лучше для меня: iPhone или Samsung?»\n"
+        "🧠 Обычный вопрос: «Объясни ипотеку простыми словами».\n\n"
+        "Просто напиши задачу своими словами. Режим выбирать не нужно."
+    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🆕 Новая тема", callback_data="new")]])
+    await safe_edit(query, text, kb, "Markdown")
 
 
-async def handle_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await _handle_text(update, context, "ask")
+# ---------- Bonus ----------
+async def bonus_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    token = await get_referral_token(user_id)
+    bot_uname = BOT_USERNAME or "secondbrainbot"
+    ref_link = f"https://t.me/{bot_uname}?start=ref_{token}"
+    user = await get_user(user_id)
+    text = (
+        "🎁 **Бонусные вопросы**\n\n"
+        "Пригласи друга во «Второй мозг».\n\n"
+        "Когда он начнёт реально пользоваться ботом и отправит 3 запроса:\n"
+        "• ты получишь +20 запросов\n"
+        "• друг получит +10 запросов\n\n"
+        f"Твоя ссылка: {ref_link}\n\n"
+        f"Приглашено: {user.get('referrer_id', '—')}\n"
+        f"Бонусных запросов: {user.get('bonus_balance', 0)}"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Поделиться с другом", url=f"https://t.me/share/url?url={ref_link}&text=🧠 Я пользуюсь «Вторым мозгом» — можно просто написать ему вопрос или ситуацию обычными словами. Попробуй:")],
+    ])
+    await safe_edit(query, text, kb, "Markdown")
 
 
-async def handle_idea(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await _handle_text(update, context, "check_idea")
+# ---------- Legacy fallback ----------
+async def legacy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await safe_edit(query,
+        "Эта кнопка относится к старой версии бота 🙂\n\n"
+        "Теперь ничего выбирать не нужно — просто напиши задачу обычным сообщением.")
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await _handle_text(update, context, "check_message")
-
-
-async def handle_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await _handle_text(update, context, "help_choose")
-
-
-async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, mode_key: str) -> int:
-    """Shared text handler — keeps context, calls AI, shows optional routing."""
+# ---------- Chat message handler ----------
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     user_id = user.id
     text = update.message.text.strip()
 
-    # Per-user lock: prevent duplicate concurrent requests
+    if not text:
+        return
+
+    # Per-user lock to avoid duplicate concurrent requests
     lock = context.user_data.get("_lock")
-    if lock and lock.locked():
-        await update.message.reply_text("⏳ Подожди, предыдущий запрос ещё обрабатывается…", reply_markup=back_keyboard())
-        return _state_for_mode(mode_key)
     if lock is None:
         lock = asyncio.Lock()
         context.user_data["_lock"] = lock
+    if lock.locked():
+        await update.message.reply_text("⏳ Подожди, предыдущий запрос ещё обрабатывается…")
+        return
 
     async with lock:
-        if len(text) > config.max_message_length:
-            await update.message.reply_text(
-                f"⚠️ Слишком длинно. Максимум {config.max_message_length} символов.\n"
-                f"У тебя: {len(text)}. Сократи и попробуй снова.",
-                reply_markup=back_keyboard(),
-            )
-            return _state_for_mode(mode_key)
-
-        context.user_data["active_mode"] = mode_key
-        context.user_data["pending_text"] = text
-
-        intro = {
-            "ask": "🧠 Думаю…",
-            "check_idea": "💡 Проверяю идею…",
-            "check_message": "✉️ Проверяю сообщение…",
-            "help_choose": "⚖️ Сравниваю варианты…",
-        }[mode_key]
-
-        thinking = await update.message.reply_text(intro)
-        await _process_input_text(user_id, text, mode_key, None, context, thinking=thinking, update=update)
-    return SELECTING
+        await _process_chat(update, context, user_id, text)
 
 
-async def _process_input_text(
-    user_id: int,
-    text: str,
-    mode_key: str,
-    intro: Optional[str],
-    context: ContextTypes.DEFAULT_TYPE,
-    thinking=None,
-    update: Optional[Update] = None,
-    query=None,
-) -> None:
-    """Core AI call. Used by both text messages and button-driven routes."""
-    try:
-        mode = get_mode(mode_key)
-        # Build context from in-memory conversation (current topic)
-        conv = context.user_data.get("conv", [])
-        history = [{"user_message": m["u"], "bot_response": m["b"]} for m in conv[-config.history_limit:]]
-
-        async with LLMClient() as client:
-            response = await client.complete(
-                system_prompt=mode.prompt,
-                user_message=text,
-                history=history,
-            )
-
-        await increment_usage(user_id)
-        remaining = await get_remaining(user_id, config.daily_limit)
-
-        # Save to DB and to in-memory context
-        await save_conversation(
-            user_id=user_id,
-            mode=mode_key,
-            user_message=text,
-            bot_response=response.content,
-            tokens_used=response.tokens_used,
+async def _process_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str) -> None:
+    # Limits
+    if not await can_make_request(user_id, DAILY_LIMIT):
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎁 Получить бонусные вопросы", callback_data="bonus")]])
+        await update.message.reply_text(
+            "🧠 На сегодня бесплатные запросы закончились.\n\n"
+            "Завтра снова будет доступно 10.\n\n"
+            "Продолжить раньше можно за бонусные запросы — пригласи друга во «Второй мозг».",
+            reply_markup=kb,
         )
-        conv.append({"u": text, "b": response.content})
-        context.user_data["conv"] = conv[-config.history_limit:]
+        return
 
-        footer = f"\n\n—\n📊 Осталось сегодня: **{remaining}** запросов"
+    # Load conversation state
+    state = await get_conversation_state(user_id)
+    awaiting = state["awaiting_clarification"]
 
-        if mode_key == "ask":
-            content = response.content + footer
-            # Optional (not forced) specialized check suggestion
-            suggestion = _suggest_route(text)
-            if suggestion:
-                content += (
-                    f"\n\nЕсли хочешь, могу отдельно проверить это как «{MODE_LABELS[suggestion].split()[1]}» "
-                    f"— нажми кнопку ниже."
-                )
-                kb = ask_route_keyboard()
+    # Build context (last ~6 pairs)
+    history = await get_recent_conversations(user_id, limit=6)
+    # If awaiting clarification, this message is a free follow-up (no charge)
+    is_free = awaiting
+
+    thinking = await update.message.reply_text("🧠 Думаю…")
+    try:
+        async with LLMClient() as client:
+            reply = await client.complete(user_message=text, history=history)
+
+        # Persist
+        mode = reply.intent
+        await save_conversation(user_id, mode, text, reply.answer, reply.total_tokens or 0)
+
+        # Update context (in-memory + DB)
+        ctx = state["context"]
+        ctx.append({"role": "user", "content": text})
+        ctx.append({"role": "assistant", "content": reply.answer})
+        ctx = ctx[-12:]  # keep last 6 pairs
+        await save_context(user_id, ctx, awaiting_clarification=reply.needs_clarification)
+
+        # Charge limit only if not a free clarification answer
+        remaining = 0
+        if not is_free:
+            # consume daily first, else bonus
+            if await daily_remaining(user_id, DAILY_LIMIT) > 0:
+                used = await increment_daily(user_id)
+                remaining = max(0, DAILY_LIMIT - used)
             else:
-                kb = ask_followup_keyboard()
+                await consume_bonus(user_id)
+                remaining = await bonus_balance(user_id)
+            await increment_total(user_id)
+            await set_awaiting_clarification(user_id, reply.needs_clarification)
+            # referral bonus check
+            activated = await record_successful_request_for_referral(user_id)
+            if activated:
+                await update.message.reply_text("🎁 Готово! За приглашение тебе начислено +10 дополнительных запросов.")
         else:
-            content = response.content + footer
-            kb = specialized_followup_keyboard()
+            # this was a clarification answer, no charge; clear flag
+            await set_awaiting_clarification(user_id, reply.needs_clarification)
 
-        if thinking:
+        await analytics.track("request", user_id, {
+            "intent": reply.intent,
+            "success": True,
+            "model": config.model,
+            "total_tokens": reply.total_tokens,
+            "cost_usd": reply.cost_usd,
+            "generation_id": reply.generation_id,
+            "daily_remaining": remaining,
+            "bonus_balance": await bonus_balance(user_id),
+        })
+        if not is_free:
+            await analytics.track("feature_used", user_id, {"intent": reply.intent})
+
+        # Build answer text
+        answer_text = reply.answer
+        if reply.next_step:
+            answer_text += f"\n\n{reply.next_step}"
+
+        # Limit counter display only when remaining <= 5
+        if not is_free and remaining <= 5 and remaining > 0:
+            answer_text += f"\n\n—\n🧠 Осталось запросов сегодня: {remaining}"
+        elif not is_free and remaining == 0:
+            answer_text += "\n\n🧠 Это был последний бесплатный запрос на сегодня.\nНовый лимит появится завтра. Дополнительные запросы можно получить за приглашение друга."
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎁 Получить бонусные вопросы", callback_data="bonus")]])
             await thinking.delete()
-        if update:
-            await update.message.reply_text(content, reply_markup=kb, parse_mode="Markdown")
-        elif query:
-            await safe_edit(query, content, kb)
+            await update.message.reply_text(answer_text, reply_markup=kb, parse_mode="Markdown")
+            return
+
+        await thinking.delete()
+        await update.message.reply_text(answer_text, parse_mode="Markdown")
 
     except (ModelError, RateLimitError) as e:
-        logger.warning(f"LLM error for user {user_id}: {e}")
-        msg = "⚠️ Не получилось получить ответ. Попробуйте ещё раз."
-        if thinking:
-            await thinking.delete()
-            await update.message.reply_text(msg, reply_markup=ask_followup_keyboard(), parse_mode="Markdown")
-        elif query:
-            await safe_edit(query, msg, back_keyboard())
+        logger.warning(f"LLM error for {user_id}: {e}")
+        await thinking.delete()
+        await update.message.reply_text("⚠️ Не получилось получить ответ. Попробуйте ещё раз.")
+        await analytics.track("request", user_id, {"success": False, "error": str(e)[:100]})
     except Exception as e:
-        logger.exception(f"Unexpected error for user {user_id}")
-        msg = "⚠️ Что-то пошло не так. Попробуйте ещё раз или вернитесь в меню."
-        if thinking:
-            await thinking.delete()
-            await update.message.reply_text(msg, reply_markup=back_keyboard(), parse_mode="Markdown")
-        elif query:
-            await safe_edit(query, msg, back_keyboard())
+        logger.exception(f"Unexpected error for {user_id}")
+        await thinking.delete()
+        await update.message.reply_text("⚠️ Что-то пошло не так. Попробуйте ещё раз или /start")
 
 
-def _suggest_route(text: str) -> Optional[str]:
-    """Lightweight heuristic suggestion (not forced routing)."""
-    t = text.lower()
-    if any(w in t for w in ["выбрать", "или ", "между", "сравн", "какой лучше", "брать или"]):
-        return "help_choose"
-    if any(w in t for w in ["открыть", "запустить", "идея", "бизнес", "план", "проект", "хочу "]):
-        return "check_idea"
-    # check_message suggestion only when it looks like a draft to send
-    if len(text) > 20 and any(w in t for w in ["привет", "здравств", "напиши", "отправ", "скажи", "ответ"]):
-        return "check_message"
-    return None
-
-
-def _state_for_mode(mode_key: str) -> int:
-    return {
-        "ask": ASK_INPUT,
-        "check_idea": IDEA_INPUT,
-        "check_message": MESSAGE_INPUT,
-        "help_choose": CHOOSE_INPUT,
-    }.get(mode_key, ASK_INPUT)
-
-
-async def safe_edit(query, text, reply_markup, menu_text: bool = False):
-    """Edit message text safely; fallback to new message if edit fails."""
-    if menu_text and text is None:
-        text = (
-            "🧠 **Второй мозг**\n\n"
-            "Просто напишите вопрос или расскажите, с чем нужно разобраться.\n\n"
-            "**Что нужно сделать?**"
-        )
-    try:
-        if isinstance(reply_markup, InlineKeyboardMarkup):
-            await query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode="Markdown")
-        else:
-            await query.edit_message_text(text=text, parse_mode="Markdown")
-    except Exception as e:
-        logger.debug(f"edit_message_text failed: {e}")
-        try:
-            await query.message.reply_text(text=text, reply_markup=reply_markup, parse_mode="Markdown")
-        except Exception:
-            pass
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel."""
-    await update.message.reply_text("Ок, вернулись в меню.", reply_markup=main_menu_keyboard())
-    return SELECTING
+async def handle_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle photos, voice, docs, stickers — text only."""
+    await update.message.reply_text(
+        "Пока я умею работать только с текстом 🙂\n\n"
+        "Напиши вопрос обычным сообщением — разберёмся."
+    )
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Global error handler."""
     logger.exception("Unhandled error", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
-            await update.effective_message.reply_text(
-                "⚠️ Что-то пошло не так. Попробуй ещё раз или /start",
-                reply_markup=main_menu_keyboard(),
-            )
+            await update.effective_message.reply_text("⚠️ Что-то пошло не так. Попробуй ещё раз или /start")
         except Exception:
             pass
-
-
-def get_conversation_handler() -> ConversationHandler:
-    """Build main ConversationHandler."""
-    return ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start),
-            CommandHandler("help", help_command),
-            CommandHandler("menu", menu_callback),
-            CallbackQueryHandler(mode_callback, pattern=r"^m:"),
-            CallbackQueryHandler(route_callback, pattern=r"^route:"),
-            CallbackQueryHandler(menu_callback, pattern=r"^menu$"),
-            CallbackQueryHandler(more_callback, pattern=r"^more$"),
-            CallbackQueryHandler(history_callback, pattern=r"^history$"),
-            CallbackQueryHandler(continue_callback, pattern=r"^continue$"),
-            CallbackQueryHandler(deeper_callback, pattern=r"^deeper$"),
-            CallbackQueryHandler(new_callback, pattern=r"^new$"),
-            CallbackQueryHandler(help_command, pattern=r"^help$"),
-        ],
-        states={
-            SELECTING: [
-                CallbackQueryHandler(mode_callback, pattern=r"^m:"),
-                CallbackQueryHandler(route_callback, pattern=r"^route:"),
-                CallbackQueryHandler(menu_callback, pattern=r"^menu$"),
-                CallbackQueryHandler(more_callback, pattern=r"^more$"),
-                CallbackQueryHandler(history_callback, pattern=r"^history$"),
-                CallbackQueryHandler(continue_callback, pattern=r"^continue$"),
-                CallbackQueryHandler(deeper_callback, pattern=r"^deeper$"),
-                CallbackQueryHandler(new_callback, pattern=r"^new$"),
-                CallbackQueryHandler(help_command, pattern=r"^help$"),
-            ],
-            ASK_INPUT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ask),
-                CommandHandler("cancel", cancel),
-            ],
-            IDEA_INPUT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_idea),
-                CommandHandler("cancel", cancel),
-            ],
-            MESSAGE_INPUT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message),
-                CommandHandler("cancel", cancel),
-            ],
-            CHOOSE_INPUT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_choose),
-                CommandHandler("cancel", cancel),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("start", start),
-            CommandHandler("cancel", cancel),
-        ],
-        name="second_brain_conversation",
-        persistent=False,
-    )
