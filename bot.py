@@ -15,7 +15,7 @@ from config import get_config
 from db import init_db, close_pool
 from handlers import (
     start, menu_command, new_topic, help_command,
-    what_callback, bonus_callback, legacy_callback,
+    bonus_callback, legacy_callback,
     handle_message, handle_non_text, error_handler,
 )
 
@@ -41,9 +41,8 @@ async def main() -> None:
     app.add_handler(CommandHandler("new", new_topic))
     app.add_handler(CommandHandler("help", help_command))
 
-    # Callback queries (menu buttons) — only the new 1.5 callbacks
+    # Callback queries
     app.add_handler(CallbackQueryHandler(new_topic, pattern=r"^new$"))
-    app.add_handler(CallbackQueryHandler(what_callback, pattern=r"^what$"))
     app.add_handler(CallbackQueryHandler(bonus_callback, pattern=r"^bonus$"))
     app.add_handler(CallbackQueryHandler(help_command, pattern=r"^help$"))
     app.add_handler(CallbackQueryHandler(menu_command, pattern=r"^menu$"))
