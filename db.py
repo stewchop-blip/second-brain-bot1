@@ -18,23 +18,10 @@ if not DATABASE_URL:
 _pool: Optional[asyncpg.Pool] = None
 
 
-async def _init_connection(conn: asyncpg.Connection) -> None:
-    # Register JSONB codec so asyncpg auto-encodes/decodes Python objects
-    await conn.set_type_codec(
-        "jsonb",
-        encoder=json.dumps,
-        decoder=json.loads,
-        schema="pg_catalog",
-    )
-
-
 async def init_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
-        _pool = await asyncpg.create_pool(
-            DATABASE_URL, min_size=1, max_size=10,
-            command_timeout=30, init=_init_connection,
-        )
+        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10, command_timeout=30)
     return _pool
 
 
@@ -199,25 +186,44 @@ async def consume_bonus(user_id: int) -> None:
 
 
 # ---- Conversation state / context ----
+def _coerce_context(raw) -> List[Dict[str, str]]:
+    """Always return a list of dicts, regardless of how asyncpg returns JSONB."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, list) else []
+        except (json.JSONDecodeError, TypeError):
+            return []
+    if isinstance(raw, list):
+        return raw
+    return []
+
+
 async def get_conversation_state(user_id: int) -> Dict[str, Any]:
     async with acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM conversation_state WHERE user_id=$1", user_id)
         if not row:
             await conn.execute("INSERT INTO conversation_state (user_id) VALUES ($1)", user_id)
             return {"user_id": user_id, "context": [], "awaiting_clarification": False, "current_topic_id": None}
-        return dict(row)
+        state = dict(row)
+        state["context"] = _coerce_context(state.get("context"))
+        return state
 
 
 async def save_context(user_id: int, context: List[Dict[str, str]], awaiting_clarification: bool = False, current_topic_id: Optional[str] = None) -> None:
+    # Serialize to JSON string and cast, so asyncpg never needs a custom codec
+    ctx_json = json.dumps(context, ensure_ascii=False)
     async with acquire() as conn:
-        await conn.execute("""
+        await conn.execute(
+            """
             INSERT INTO conversation_state (user_id, context, awaiting_clarification, current_topic_id)
             VALUES ($1, $2::jsonb, $3, $4)
             ON CONFLICT (user_id) DO UPDATE SET context=$2::jsonb, awaiting_clarification=$3, current_topic_id=$4
-        """, user_id, context, awaiting_clarification, current_topic_id)
-
-
-async def clear_context(user_id: int) -> None:
+            """,
+            user_id, ctx_json, awaiting_clarification, current_topic_id,
+        )
     async with acquire() as conn:
         await conn.execute("UPDATE conversation_state SET context='[]'::jsonb, awaiting_clarification=FALSE, current_topic_id=NULL WHERE user_id=$1", user_id)
 
@@ -257,10 +263,12 @@ async def record_successful_request_for_referral(user_id: int) -> None:
 
 # ---- Analytics ----
 async def track_event(user_id: int, event_name: str, properties: Dict[str, Any]) -> None:
+    # Serialize to JSON string; asyncpg casts to jsonb without a custom codec
+    props_json = json.dumps(properties, ensure_ascii=False, default=str)
     async with acquire() as conn:
         await conn.execute(
             "INSERT INTO analytics_events (user_id, event_name, properties) VALUES ($1, $2, $3::jsonb)",
-            user_id, event_name, properties,
+            user_id, event_name, props_json,
         )
 
 
