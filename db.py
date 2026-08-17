@@ -91,7 +91,8 @@ async def init_db() -> None:
                 properties JSONB DEFAULT '{}'::jsonb
             )
         """)
-        await conn.execute("""
+        await conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS conversations (
                 id BIGSERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL,
@@ -101,7 +102,24 @@ async def init_db() -> None:
                 tokens_used INT DEFAULT 0,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
-        """)
+            """
+        )
+        # --- Migrations: add columns that may be missing from older schemas ---
+        # CREATE TABLE IF NOT EXISTS does NOT alter existing tables, so we
+        # explicitly add columns that the current code expects.
+        migrations = [
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_request_at TIMESTAMPTZ;",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_request_at TIMESTAMPTZ;",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS source_param TEXT;",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_token TEXT UNIQUE;",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_id BIGINT;",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_balance INT DEFAULT 0;",
+        ]
+        for stmt in migrations:
+            try:
+                await conn.execute(stmt)
+            except Exception as e:
+                logger.warning(f"migration skipped: {stmt} -> {e}")
 
 
 # ---- Users ----
