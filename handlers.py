@@ -251,7 +251,7 @@ async def _process_chat(update: Update, user_id: int, text: str) -> None:
     except Exception as e:
         logger.exception(f"Unexpected error for {user_id}")
         await thinking.delete()
-        await update.message.reply_text("⚠️ Что-то пошло не так. Попробуй ещё раз или /start.")
+        await update.message.reply_text(f"⚠️ Ошибка: {type(e).__name__}: {str(e)[:200]}\n\nПопробуй ещё раз или /start.")
 
 
 async def handle_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -262,9 +262,12 @@ async def handle_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled error", exc_info=context.error)
+    err = context.error
+    logger.exception("Unhandled error", exc_info=err)
     if isinstance(update, Update) and update.effective_message:
         try:
-            await update.effective_message.reply_text("⚠️ Что-то пошло не так. Попробуй ещё раз или /start")
+            await update.effective_message.reply_text(
+                f"⚠️ Ошибка: {type(err).__name__}: {str(err)[:200]}\n\nПопробуй ещё раз или /start"
+            )
         except Exception:
             pass
