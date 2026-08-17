@@ -224,6 +224,9 @@ async def save_context(user_id: int, context: List[Dict[str, str]], awaiting_cla
             """,
             user_id, ctx_json, awaiting_clarification, current_topic_id,
         )
+
+
+async def clear_context(user_id: int) -> None:
     async with acquire() as conn:
         await conn.execute("UPDATE conversation_state SET context='[]'::jsonb, awaiting_clarification=FALSE, current_topic_id=NULL WHERE user_id=$1", user_id)
 
