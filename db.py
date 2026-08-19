@@ -7,6 +7,7 @@ import asyncpg
 import json
 import os
 import secrets
+import logging
 from datetime import date, datetime, timedelta
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
@@ -17,8 +18,10 @@ DATABASE_URL = (
     or os.getenv("POSTGRES_URL")
     or os.getenv("POSTGRES_PRIVATE_URL")
 )
+# NOTE: Do NOT raise here. Railway/Render healthcheck needs the process to
+# start and serve GET / even if DB is not yet reachable. We connect lazily.
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL environment variable is required (Railway/Postgres provides it automatically)")
+    logger.warning("DATABASE_URL not set at import time; DB connection deferred until first use.")
 
 _pool: Optional[asyncpg.Pool] = None
 
@@ -26,6 +29,8 @@ _pool: Optional[asyncpg.Pool] = None
 async def init_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL is required to connect to the database")
         _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10, command_timeout=30)
     return _pool
 

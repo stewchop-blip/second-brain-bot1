@@ -30,8 +30,11 @@ config = get_config()
 
 async def main() -> None:
     logger.info("Initializing database...")
-    await init_db()
-    logger.info("Database ready")
+    try:
+        await init_db()
+        logger.info("Database ready")
+    except Exception as e:
+        logger.warning(f"Database init failed (bot will retry on first request): {e}")
 
     app = ApplicationBuilder().token(config.bot_token).build()
 
