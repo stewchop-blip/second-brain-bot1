@@ -36,11 +36,27 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        # Railway provides DATABASE_URL automatically; fall back to common names
+        database_url = (
+            os.getenv("DATABASE_URL")
+            or os.getenv("DATABASE_PRIVATE_URL")
+            or os.getenv("POSTGRES_URL")
+            or os.getenv("POSTGRES_PRIVATE_URL")
+        )
+        if not database_url:
+            raise RuntimeError("Missing required environment variable: DATABASE_URL (or DATABASE_PRIVATE_URL/POSTGRES_URL)")
+        # Webhook base URL: explicit, then platform-provided
+        webhook_url = (
+            os.getenv("WEBHOOK_URL")
+            or os.getenv("RENDER_EXTERNAL_URL")
+            or (f"https://{os.getenv('RAILWAY_PUBLIC_DOMAIN')}" if os.getenv("RAILWAY_PUBLIC_DOMAIN") else None)
+            or os.getenv("RAILWAY_STATIC_URL")
+        )
         return cls(
             bot_token=_require("BOT_TOKEN"),
-            database_url=_require("DATABASE_URL"),
+            database_url=database_url,
             openrouter_api_key=_require("OPENROUTER_API_KEY"),
-            webhook_url=os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL"),
+            webhook_url=webhook_url,
             webhook_secret=os.getenv("WEBHOOK_SECRET"),
             webhook_path=os.getenv("WEBHOOK_PATH", "/webhook"),
             port=int(os.getenv("PORT", "8080")),
@@ -51,7 +67,7 @@ class Config:
             temperature=float(os.getenv("TEMPERATURE", "0.7")),
             request_timeout=int(os.getenv("REQUEST_TIMEOUT", "30")),
             max_retries=int(os.getenv("MAX_RETRIES", "3")),
-            daily_limit=int(os.getenv("DAILY_LIMIT", "20")),
+            daily_limit=int(os.getenv("DAILY_LIMIT", "10")),
             max_message_length=int(os.getenv("MAX_MESSAGE_LENGTH", "4000")),
             history_limit=int(os.getenv("HISTORY_LIMIT", "10")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),

@@ -76,9 +76,14 @@ async def main() -> None:
     async def handle_health(request: web.Request) -> web.Response:
         return web.Response(text="OK")
 
+    async def handle_root(request: web.Request) -> web.Response:
+        # Railway healthcheck hits GET / — must return 200, not 404
+        return web.Response(text="OK")
+
     aio_app = web.Application()
     aio_app.router.add_post(config.webhook_path, handle_webhook)
     aio_app.router.add_get("/health", handle_health)
+    aio_app.router.add_get("/", handle_root)
 
     await app.bot.set_webhook(url=full_url, secret_token=config.webhook_secret)
     logger.info(f"Webhook registered at: {full_url}")
