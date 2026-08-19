@@ -12,6 +12,8 @@ from datetime import date, datetime, timedelta
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
 
+logger = logging.getLogger(__name__)
+
 DATABASE_URL = (
     os.getenv("DATABASE_URL")
     or os.getenv("DATABASE_PRIVATE_URL")
