@@ -1,7 +1,11 @@
 """
 Main entry point for Second Brain Bot 1.5.
-Web Service mode: aiohttp server with /webhook (Telegram) and /health (Render).
+Web Service mode: aiohttp server with /webhook (Telegram) and /health + / (Railway/Render).
 Single-chat core: no ConversationHandler, plain message dispatcher.
+
+IMPORTANT: the HTTP server MUST start even if the webhook URL is missing or the
+DB is not yet reachable — otherwise the platform healthcheck fails and the
+service is killed. Webhook registration is best-effort.
 """
 import os
 import logging
@@ -29,12 +33,13 @@ config = get_config()
 
 
 async def main() -> None:
+    # DB init is best-effort: don't crash the process if it fails at boot.
     logger.info("Initializing database...")
     try:
         await init_db()
         logger.info("Database ready")
     except Exception as e:
-        logger.warning(f"Database init failed (bot will retry on first request): {e}")
+        logger.warning(f"Database init failed (will retry on first request): {e}")
 
     app = ApplicationBuilder().token(config.bot_token).build()
 
@@ -61,12 +66,22 @@ async def main() -> None:
     await app.initialize()
     await app.start()
 
+    # ---- Webhook registration (best-effort, never block server start) ----
     webhook_url = config.webhook_url
-    if not webhook_url:
-        logger.error("No webhook URL available (set WEBHOOK_URL or use Render's RENDER_EXTERNAL_URL).")
-        return
-    full_url = f"{webhook_url.rstrip('/')}{config.webhook_path}"
+    if webhook_url:
+        full_url = f"{webhook_url.rstrip('/')}{config.webhook_path}"
+        try:
+            await app.bot.set_webhook(url=full_url, secret_token=config.webhook_secret)
+            logger.info(f"Webhook registered at: {full_url}")
+        except Exception as e:
+            logger.warning(f"Webhook registration failed (bot won't receive updates until fixed): {e}")
+    else:
+        logger.warning(
+            "WEBHOOK_URL / RAILWAY_PUBLIC_DOMAIN not set — webhook NOT registered. "
+            "Set WEBHOOK_URL in Railway Variables to enable Telegram updates."
+        )
 
+    # ---- HTTP server (MUST start for platform healthcheck) ----
     async def handle_webhook(request: web.Request) -> web.Response:
         try:
             data = await request.json()
@@ -88,9 +103,6 @@ async def main() -> None:
     aio_app.router.add_get("/health", handle_health)
     aio_app.router.add_get("/", handle_root)
 
-    await app.bot.set_webhook(url=full_url, secret_token=config.webhook_secret)
-    logger.info(f"Webhook registered at: {full_url}")
-
     runner = web.AppRunner(aio_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", config.port)
@@ -104,7 +116,10 @@ async def main() -> None:
         pass
     finally:
         logger.info("Shutting down...")
-        await app.bot.delete_webhook()
+        try:
+            await app.bot.delete_webhook()
+        except Exception:
+            pass
         await app.stop()
         await app.shutdown()
         await close_pool()
