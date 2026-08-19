@@ -3,13 +3,15 @@ Main entry point for Second Brain Bot 1.5.
 Web Service mode: aiohttp server with /webhook (Telegram) and /health + / (Railway/Render).
 Single-chat core: no ConversationHandler, plain message dispatcher.
 
-IMPORTANT: the HTTP server MUST start even if the webhook URL is missing or the
-DB is not yet reachable — otherwise the platform healthcheck fails and the
-service is killed. Webhook registration is best-effort.
+CRITICAL for platform healthchecks (Railway/Render):
+  The HTTP server MUST be started FIRST and kept alive even if the Telegram
+  app init or webhook registration fails. Otherwise the platform healthcheck
+  sees "service unavailable" and kills the container.
 """
 import os
 import logging
 import asyncio
+import traceback
 
 from aiohttp import web
 from telegram import Update
@@ -25,7 +27,7 @@ from handlers import (
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=get_config().log_level,
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
@@ -33,55 +35,25 @@ config = get_config()
 
 
 async def main() -> None:
-    # DB init is best-effort: don't crash the process if it fails at boot.
-    logger.info("Initializing database...")
-    try:
-        await init_db()
-        logger.info("Database ready")
-    except Exception as e:
-        logger.warning(f"Database init failed (will retry on first request): {e}")
-
+    # ---- Build the Telegram application (no start yet) ----
     app = ApplicationBuilder().token(config.bot_token).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("new", new_topic))
     app.add_handler(CommandHandler("help", help_command))
 
-    # Callback queries
     app.add_handler(CallbackQueryHandler(new_topic, pattern=r"^new$"))
     app.add_handler(CallbackQueryHandler(bonus_callback, pattern=r"^bonus$"))
     app.add_handler(CallbackQueryHandler(help_command, pattern=r"^help$"))
     app.add_handler(CallbackQueryHandler(menu_command, pattern=r"^menu$"))
-    # Legacy fallback for any old button callback
     app.add_handler(CallbackQueryHandler(legacy_callback))
 
-    # Messages: text -> chat; anything else -> non-text handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_non_text))
-
     app.add_error_handler(error_handler)
 
-    await app.initialize()
-    await app.start()
-
-    # ---- Webhook registration (best-effort, never block server start) ----
-    webhook_url = config.webhook_url
-    if webhook_url:
-        full_url = f"{webhook_url.rstrip('/')}{config.webhook_path}"
-        try:
-            await app.bot.set_webhook(url=full_url, secret_token=config.webhook_secret)
-            logger.info(f"Webhook registered at: {full_url}")
-        except Exception as e:
-            logger.warning(f"Webhook registration failed (bot won't receive updates until fixed): {e}")
-    else:
-        logger.warning(
-            "WEBHOOK_URL / RAILWAY_PUBLIC_DOMAIN not set — webhook NOT registered. "
-            "Set WEBHOOK_URL in Railway Variables to enable Telegram updates."
-        )
-
-    # ---- HTTP server (MUST start for platform healthcheck) ----
+    # ---- HTTP server (start FIRST so healthcheck always passes) ----
     async def handle_webhook(request: web.Request) -> web.Response:
         try:
             data = await request.json()
@@ -95,7 +67,6 @@ async def main() -> None:
         return web.Response(text="OK")
 
     async def handle_root(request: web.Request) -> web.Response:
-        # Railway healthcheck hits GET / — must return 200, not 404
         return web.Response(text="OK")
 
     aio_app = web.Application()
@@ -107,8 +78,29 @@ async def main() -> None:
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", config.port)
     await site.start()
-    logger.info(f"HTTP server listening on port {config.port}")
+    logger.info(f"HTTP server listening on port {config.port} (healthcheck should pass now)")
 
+    # ---- Now initialize Telegram app + DB + webhook (best-effort) ----
+    try:
+        logger.info("Initializing database...")
+        await init_db()
+        logger.info("Database ready")
+
+        await app.initialize()
+        await app.start()
+
+        webhook_url = config.webhook_url
+        if webhook_url:
+            full_url = f"{webhook_url.rstrip('/')}{config.webhook_path}"
+            await app.bot.set_webhook(url=full_url, secret_token=config.webhook_secret)
+            logger.info(f"Webhook registered at: {full_url}")
+        else:
+            logger.warning("WEBHOOK_URL not set — webhook NOT registered.")
+    except Exception:
+        logger.error("Startup of Telegram/DB/webhook failed (server still running for healthcheck):\n"
+                     + traceback.format_exc())
+
+    # ---- Keep the process alive ----
     try:
         while True:
             await asyncio.sleep(3600)
@@ -120,8 +112,11 @@ async def main() -> None:
             await app.bot.delete_webhook()
         except Exception:
             pass
-        await app.stop()
-        await app.shutdown()
+        try:
+            await app.stop()
+            await app.shutdown()
+        except Exception:
+            pass
         await close_pool()
         await runner.cleanup()
 
