@@ -1,86 +1,83 @@
-"""Configuration management for Second Brain Bot."""
+"""
+Configuration management for Second Brain Bot.
+Loads everything from environment variables.
+
+IMPORTANT: NEVER raise at import time. If a variable is missing, fall back to a
+sensible default (or None) so that importing this module — and starting the
+HTTP server for platform healthchecks — never crashes.
+"""
 import os
-from dataclasses import dataclass
-from functools import lru_cache
 
 
-@dataclass(frozen=True)
-class Config:
-    # Required (no defaults — must come first in dataclass)
-    bot_token: str
-    database_url: str
-    openrouter_api_key: str
-
-    # Telegram
-    webhook_url: str | None = None
-    webhook_secret: str | None = None
-    webhook_path: str = "/webhook"
-    port: int = 8080
-    bot_username: str | None = None
-
-    # LLM (OpenRouter)
-    openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    model: str = "gpt-4o-mini"
-    max_tokens: int = 1500
-    temperature: float = 0.7
-    request_timeout: int = 30
-    max_retries: int = 3
-
-    # Limits
-    daily_limit: int = 20
-    max_message_length: int = 4000
-    history_limit: int = 10  # messages to keep for context
-
-    # Logging
-    log_level: str = "INFO"
-
-    @classmethod
-    def from_env(cls) -> "Config":
-        # Railway provides DATABASE_URL automatically; fall back to common names
-        database_url = (
-            os.getenv("DATABASE_URL")
-            or os.getenv("DATABASE_PRIVATE_URL")
-            or os.getenv("POSTGRES_URL")
-            or os.getenv("POSTGRES_PRIVATE_URL")
-        )
-        if not database_url:
-            raise RuntimeError("Missing required environment variable: DATABASE_URL (or DATABASE_PRIVATE_URL/POSTGRES_URL)")
-        # Webhook base URL: explicit, then platform-provided
-        webhook_url = (
-            os.getenv("WEBHOOK_URL")
-            or os.getenv("RENDER_EXTERNAL_URL")
-            or (f"https://{os.getenv('RAILWAY_PUBLIC_DOMAIN')}" if os.getenv("RAILWAY_PUBLIC_DOMAIN") else None)
-            or os.getenv("RAILWAY_STATIC_URL")
-        )
-        return cls(
-            bot_token=_require("BOT_TOKEN"),
-            database_url=database_url,
-            openrouter_api_key=_require("OPENROUTER_API_KEY"),
-            webhook_url=webhook_url,
-            webhook_secret=os.getenv("WEBHOOK_SECRET"),
-            webhook_path=os.getenv("WEBHOOK_PATH", "/webhook"),
-            port=int(os.getenv("PORT", "8080")),
-            bot_username=os.getenv("BOT_USERNAME"),
-            openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-            model=os.getenv("MODEL", "gpt-4o-mini"),
-            max_tokens=int(os.getenv("MAX_TOKENS", "1500")),
-            temperature=float(os.getenv("TEMPERATURE", "0.7")),
-            request_timeout=int(os.getenv("REQUEST_TIMEOUT", "30")),
-            max_retries=int(os.getenv("MAX_RETRIES", "3")),
-            daily_limit=int(os.getenv("DAILY_LIMIT", "10")),
-            max_message_length=int(os.getenv("MAX_MESSAGE_LENGTH", "4000")),
-            history_limit=int(os.getenv("HISTORY_LIMIT", "10")),
-            log_level=os.getenv("LOG_LEVEL", "INFO"),
-        )
+def _env(key: str, default=None):
+    val = os.getenv(key)
+    if val is None or val == "":
+        return default
+    return val
 
 
-def _require(key: str) -> str:
-    value = os.getenv(key)
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {key}")
-    return value
+# --- Required secrets (no hard crash if absent; checked where used) ---
+BOT_TOKEN = _env("BOT_TOKEN")
+OPENROUTER_API_KEY = _env("OPENROUTER_API_KEY")
+
+# --- Database (Railway provides DATABASE_URL; fall back to common names) ---
+DATABASE_URL = (
+    _env("DATABASE_URL")
+    or _env("DATABASE_PRIVATE_URL")
+    or _env("POSTGRES_URL")
+    or _env("POSTGRES_PRIVATE_URL")
+)
+
+# --- Webhook base URL ---
+WEBHOOK_HOST = (
+    _env("WEBHOOK_URL")
+    or _env("RENDER_EXTERNAL_URL")
+    or (f"https://{_env('RAILWAY_PUBLIC_DOMAIN')}" if _env("RAILWAY_PUBLIC_DOMAIN") else None)
+    or _env("RAILWAY_STATIC_URL")
+)
+WEBHOOK_SECRET = _env("WEBHOOK_SECRET")
+WEBHOOK_PATH = _env("WEBHOOK_PATH", "/webhook")
+PORT = int(_env("PORT", "8080"))
+BOT_USERNAME = _env("BOT_USERNAME")
+
+# --- LLM (OpenRouter) ---
+OPENROUTER_BASE_URL = _env("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+MODEL = _env("MODEL", "gpt-4o-mini")
+MAX_TOKENS = int(_env("MAX_TOKENS", "1500"))
+TEMPERATURE = float(_env("TEMPERATURE", "0.7"))
+REQUEST_TIMEOUT = int(_env("REQUEST_TIMEOUT", "30"))
+MAX_RETRIES = int(_env("MAX_RETRIES", "3"))
+
+# --- Limits ---
+DAILY_LIMIT = int(_env("DAILY_LIMIT", "10"))
+MAX_MESSAGE_LENGTH = int(_env("MAX_MESSAGE_LENGTH", "4000"))
+HISTORY_LIMIT = int(_env("HISTORY_LIMIT", "10"))
+
+LOG_LEVEL = _env("LOG_LEVEL", "INFO")
 
 
-@lru_cache(maxsize=1)
-def get_config() -> Config:
-    return Config.from_env()
+# Backwards-compatible accessor: returns an object with attribute access.
+# Used by bot.py / handlers.py via `config = get_config()`.
+from types import SimpleNamespace
+
+def get_config():
+    return SimpleNamespace(
+        bot_token=BOT_TOKEN,
+        openrouter_api_key=OPENROUTER_API_KEY,
+        database_url=DATABASE_URL,
+        webhook_url=WEBHOOK_HOST,
+        webhook_secret=WEBHOOK_SECRET,
+        webhook_path=WEBHOOK_PATH,
+        port=PORT,
+        bot_username=BOT_USERNAME,
+        openrouter_base_url=OPENROUTER_BASE_URL,
+        model=MODEL,
+        max_tokens=MAX_TOKENS,
+        temperature=TEMPERATURE,
+        request_timeout=REQUEST_TIMEOUT,
+        max_retries=MAX_RETRIES,
+        daily_limit=DAILY_LIMIT,
+        max_message_length=MAX_MESSAGE_LENGTH,
+        history_limit=HISTORY_LIMIT,
+        log_level=LOG_LEVEL,
+    )
