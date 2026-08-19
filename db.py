@@ -11,9 +11,14 @@ from datetime import date, datetime, timedelta
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = (
+    os.getenv("DATABASE_URL")
+    or os.getenv("DATABASE_PRIVATE_URL")
+    or os.getenv("POSTGRES_URL")
+    or os.getenv("POSTGRES_PRIVATE_URL")
+)
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL environment variable is required")
+    raise RuntimeError("DATABASE_URL environment variable is required (Railway/Postgres provides it automatically)")
 
 _pool: Optional[asyncpg.Pool] = None
 
