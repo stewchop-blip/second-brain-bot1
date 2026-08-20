@@ -312,6 +312,7 @@ async def _process_chat(update: Update, user_id: int, text: str) -> None:
             "Продолжить раньше можно за бонусные запросы — пригласи друга.",
             reply_markup=bonus_button(),
         )
+        await analytics.track("limit_reached", user_id, {"daily_limit": DAILY_LIMIT})
         return
 
     state = await get_conversation_state(user_id)
@@ -383,10 +384,12 @@ async def _process_chat(update: Update, user_id: int, text: str) -> None:
         await thinking.delete()
         await update.message.reply_text("⚠️ Не получилось получить ответ. Попробуй ещё раз.")
         await analytics.track("request", user_id, {"success": False, "error": str(e)[:100]})
+        await analytics.track("request_failed", user_id, {"reason": "llm_error"})
     except Exception:
         logger.exception(f"Unexpected error for {user_id}")
         await thinking.delete()
         await update.message.reply_text("⚠️ Что-то пошло не так. Попробуй ещё раз или /start.")
+        await analytics.track("request_failed", user_id, {"reason": "unexpected"})
 
 
 async def handle_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
