@@ -93,8 +93,10 @@ class LLMClient:
         self,
         user_message: str,
         history: Optional[List[Dict[str, str]]] = None,
+        system_prompt: Optional[str] = None,
     ) -> List[Dict[str, str]]:
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        system = system_prompt if system_prompt is not None else SYSTEM_PROMPT
+        messages = [{"role": "system", "content": system}]
         if history:
             for msg in history:
                 messages.append({"role": "user", "content": msg["user_message"]})
@@ -169,6 +171,49 @@ class LLMClient:
             cost_usd=data.get("cost") if isinstance(data.get("cost"), (int, float)) else None,
             generation_id=data.get("id"),
         )
+
+    @retry(
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        stop=stop_after_attempt(MAX_RETRIES),
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError, RateLimitError)),
+        reraise=True,
+    )
+    async def complete_plain(
+        self,
+        user_message: str,
+        system_prompt: str,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> str:
+        """Send a plain (non-JSON) completion. Used by the Humanizer.
+
+        Returns the model's text directly — no structured parsing.
+        """
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens or self.max_tokens,
+            "temperature": temperature if temperature is not None else self.temperature,
+            "stream": False,
+        }
+
+        response = await self.client.post("/chat/completions", json=payload)
+
+        if response.status_code == 429:
+            raise RateLimitError("Rate limit exceeded")
+        if response.status_code == 402:
+            raise RateLimitError("Payment required (insufficient credits)")
+        if response.status_code >= 400:
+            error_data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+            error_msg = error_data.get("error", {}).get("message", response.text)
+            raise ModelError(f"API error {response.status_code}: {error_msg}")
+
+        data = response.json()
+        return data["choices"][0]["message"]["content"].strip()
 
 
 async def get_llm_client() -> LLMClient:

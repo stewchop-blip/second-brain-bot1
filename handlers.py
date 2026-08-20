@@ -22,17 +22,36 @@ from db import (
 )
 from llm_client import LLMClient, ModelError, RateLimitError
 from analytics import analytics
+from prompts import humanize_prompt, HUMANIZE_LEVELS
 
 logger = logging.getLogger(__name__)
 
 config = get_config()
 DAILY_LIMIT = config.daily_limit  # 10 per spec
 BOT_USERNAME = getattr(config, "bot_username", None)
+MAX_MESSAGE_LENGTH = getattr(config, "max_message_length", 4000)
+# Hard cap for a single humanize request (keeps API cost bounded)
+HUMANIZE_MAX_LENGTH = 8000
 
 
 # ---------- Keyboards (minimal) ----------
 def new_topic_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🆕 Новая тема", callback_data="new")],
+    ])
+
+
+def humanize_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✨ Очеловечить текст", callback_data="humanize")],
+        [InlineKeyboardButton("🆕 Новая тема", callback_data="new")],
+    ])
+
+
+def humanize_again_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Сделать ещё естественнее", callback_data="humanize_strong")],
+        [InlineKeyboardButton("✨ Другой текст", callback_data="humanize")],
         [InlineKeyboardButton("🆕 Новая тема", callback_data="new")],
     ])
 
@@ -76,18 +95,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Что у тебя на уме?"
     )
     if update.message:
-        await update.message.reply_text(text, reply_markup=new_topic_keyboard())
+        await update.message.reply_text(text, reply_markup=humanize_keyboard())
     elif update.callback_query:
-        await safe_edit(update.callback_query, text, new_topic_keyboard())
+        await safe_edit(update.callback_query, text, humanize_keyboard())
 
 
 # ---------- Menu ----------
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = "🧠 Второй мозг\n\nПросто напиши задачу — режим выбирать не нужно."
     if update.message:
-        await update.message.reply_text(text, reply_markup=new_topic_keyboard())
+        await update.message.reply_text(text, reply_markup=humanize_keyboard())
     elif update.callback_query:
-        await safe_edit(update.callback_query, text, new_topic_keyboard())
+        await safe_edit(update.callback_query, text, humanize_keyboard())
 
 
 # ---------- New topic ----------
@@ -95,11 +114,12 @@ async def new_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     await clear_context(user_id)
     await set_awaiting_clarification(user_id, False)
+    context.user_data.pop("humanize_mode", None)
     text = "🆕 Начали новую тему.\n\nПредыдущий разговор больше не учитываю.\n\nО чём поговорим теперь?"
     if update.message:
-        await update.message.reply_text(text)
+        await update.message.reply_text(text, reply_markup=humanize_keyboard())
     elif update.callback_query:
-        await safe_edit(update.callback_query, text)
+        await safe_edit(update.callback_query, text, humanize_keyboard())
 
 
 # ---------- Help ----------
@@ -108,13 +128,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "❓ Как пользоваться\n\n"
         "Просто напиши вопрос или опиши ситуацию обычными словами.\n\n"
         "Я сам пойму, нужно ли ответить на вопрос, проверить сообщение, разобрать идею или помочь выбрать.\n\n"
+        "Хочешь сделать текст естественнее — нажми «✨ Очеловечить текст».\n\n"
         "Чтобы начать с чистого листа — нажми 🆕 Новая тема.\n\n"
         "Сейчас бот работает только с текстом."
     )
     if update.message:
-        await update.message.reply_text(text, reply_markup=new_topic_keyboard())
+        await update.message.reply_text(text, reply_markup=humanize_keyboard())
     elif update.callback_query:
-        await safe_edit(update.callback_query, text, new_topic_keyboard())
+        await safe_edit(update.callback_query, text, humanize_keyboard())
 
 
 # ---------- Bonus ----------
@@ -149,12 +170,126 @@ async def legacy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "Теперь просто напиши задачу обычным сообщением — ничего выбирать не нужно.")
 
 
+# ---------- Humanizer ----------
+async def humanize_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Entry point: user chose «Очеловечить текст» (NORMAL level)."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data["humanize_mode"] = "NORMAL"
+    text = "✨ Очеловечить текст\n\nПришли текст, который хочешь сделать естественнее 👇\n\n(Когда закончим — вернёмся к обычному общению.)"
+    await safe_edit(query, text)
+
+
+async def humanize_strong_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """«Сделать ещё естественнее» — deeper pass on the same text."""
+    query = update.callback_query
+    await query.answer()
+    prev = context.user_data.get("humanize_last_text")
+    if not prev:
+        context.user_data["humanize_mode"] = "STRONG"
+        await safe_edit(query, "✨ Пришли текст, который хочешь сделать естественнее 👇")
+        return
+    context.user_data["humanize_mode"] = "STRONG"
+    # Re-process the last text at STRONG level directly
+    await _process_humanize(update, context, prev, level="STRONG", edit=True)
+
+
+async def _process_humanize(update, context, text: str, level: str = "NORMAL", edit: bool = False) -> None:
+    user = update.effective_user
+    user_id = user.id
+    text = (text or "").strip()
+
+    if not text:
+        msg = update.callback_query.message if edit else update.message
+        await msg.reply_text("Пустое сообщение. Пришли текст, который нужно переработать.")
+        return
+
+    if len(text) > HUMANIZE_MAX_LENGTH:
+        msg = update.callback_query.message if edit else update.message
+        await msg.reply_text(
+            f"Текст слишком длинный (максимум {HUMANIZE_MAX_LENGTH} символов). "
+            "Пришли его частями."
+        )
+        return
+
+    # Rate-limit: same daily budget as normal chat
+    if not await can_make_request(user_id, DAILY_LIMIT):
+        msg = update.callback_query.message if edit else update.message
+        await msg.reply_text(
+            "🧠 На сегодня бесплатные запросы закончились.\n\n"
+            "Завтра снова будет доступно 10.\n\n"
+            "Продолжить раньше можно за бонусные запросы — пригласи друга.",
+            reply_markup=bonus_button(),
+        )
+        return
+
+    target_msg = update.callback_query.message if edit else update.message
+    thinking = await target_msg.reply_text("✨ Делаю текст живее…")
+
+    try:
+        async with LLMClient() as client:
+            result = await client.complete_plain(
+                user_message=text,
+                system_prompt=humanize_prompt(level),
+                max_tokens=max(400, min(int(len(text) * 1.5) + 400, 2000)),
+                temperature=0.7,
+            )
+    except (ModelError, RateLimitError) as e:
+        logger.warning(f"Humanize LLM error for {user_id}: {e}")
+        await thinking.delete()
+        await target_msg.reply_text("⚠️ Не получилось переработать текст. Попробуй ещё раз.")
+        return
+    except Exception:
+        logger.exception(f"Unexpected humanize error for {user_id}")
+        await thinking.delete()
+        await target_msg.reply_text("⚠️ Что-то пошло не так. Попробуй ещё раз.")
+        return
+
+    result = (result or "").strip()
+    if not result:
+        await thinking.delete()
+        await target_msg.reply_text("⚠️ Не получилось переработать текст. Попробуй ещё раз.")
+        return
+
+    # Account usage (same budget as normal requests)
+    used = await increment_daily(user_id)
+    remaining = max(0, DAILY_LIMIT - used)
+    await increment_total(user_id)
+    await set_awaiting_clarification(user_id, False)
+
+    context.user_data["humanize_last_text"] = text
+    context.user_data["humanize_mode"] = None  # return to normal chat afterwards
+
+    await thinking.delete()
+    out = result
+    if remaining <= 5 and remaining > 0:
+        out += f"\n\n—\n🧠 Осталось запросов сегодня: {remaining}"
+    await target_msg.reply_text(out, reply_markup=humanize_again_keyboard())
+    await analytics.track("humanize", user_id, {"level": level, "success": True, "length": len(text)})
+
+
 # ---------- Chat ----------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     user_id = user.id
     text = (update.message.text or "").strip()
     if not text:
+        return
+
+    # Humanizer mode: route text to the humanizer pipeline
+    if context.user_data.get("humanize_mode"):
+        level = context.user_data.get("humanize_mode")
+        if level not in HUMANIZE_LEVELS:
+            level = "NORMAL"
+        await _process_humanize(update, context, text, level=level)
+        return
+
+    # Length guard (defense against oversized/abusive requests)
+    if len(text) > MAX_MESSAGE_LENGTH:
+        await update.message.reply_text(
+            f"Сообщение слишком длинное (максимум {MAX_MESSAGE_LENGTH} символов). "
+            "Сократи или пришли по частям."
+        )
         return
 
     lock = context.user_data.get("_lock")
@@ -248,10 +383,10 @@ async def _process_chat(update: Update, user_id: int, text: str) -> None:
         await thinking.delete()
         await update.message.reply_text("⚠️ Не получилось получить ответ. Попробуй ещё раз.")
         await analytics.track("request", user_id, {"success": False, "error": str(e)[:100]})
-    except Exception as e:
+    except Exception:
         logger.exception(f"Unexpected error for {user_id}")
         await thinking.delete()
-        await update.message.reply_text(f"⚠️ Ошибка: {type(e).__name__}: {str(e)[:200]}\n\nПопробуй ещё раз или /start.")
+        await update.message.reply_text("⚠️ Что-то пошло не так. Попробуй ещё раз или /start.")
 
 
 async def handle_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -267,7 +402,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     if isinstance(update, Update) and update.effective_message:
         try:
             await update.effective_message.reply_text(
-                f"⚠️ Ошибка: {type(err).__name__}: {str(err)[:200]}\n\nПопробуй ещё раз или /start"
+                "⚠️ Что-то пошло не так. Попробуй ещё раз или /start"
             )
         except Exception:
             pass

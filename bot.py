@@ -22,6 +22,7 @@ from db import init_db, close_pool
 from handlers import (
     start, menu_command, new_topic, help_command,
     bonus_callback, legacy_callback,
+    humanize_callback, humanize_strong_callback,
     handle_message, handle_non_text, error_handler,
 )
 
@@ -47,6 +48,8 @@ async def main() -> None:
     app.add_handler(CallbackQueryHandler(bonus_callback, pattern=r"^bonus$"))
     app.add_handler(CallbackQueryHandler(help_command, pattern=r"^help$"))
     app.add_handler(CallbackQueryHandler(menu_command, pattern=r"^menu$"))
+    app.add_handler(CallbackQueryHandler(humanize_callback, pattern=r"^humanize$"))
+    app.add_handler(CallbackQueryHandler(humanize_strong_callback, pattern=r"^humanize_strong$"))
     app.add_handler(CallbackQueryHandler(legacy_callback))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -55,11 +58,23 @@ async def main() -> None:
 
     # ---- HTTP server (start FIRST so healthcheck always passes) ----
     async def handle_webhook(request: web.Request) -> web.Response:
+        # Reject obviously forged requests: Telegram always POSTs JSON.
+        if request.content_type != "application/json":
+            return web.Response(status=400)
+        # Optional secret-token validation (Telegram sends X-Telegram-Bot-Api-Secret-Token)
+        secret = config.webhook_secret
+        if secret and all(c.isalnum() or c in "-_" for c in secret):
+            if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != secret:
+                return web.Response(status=403)
         try:
             data = await request.json()
         except Exception:
             return web.Response(status=400)
+        if not isinstance(data, dict):
+            return web.Response(status=400)
         update = Update.de_json(data, app.bot)
+        if update is None:
+            return web.Response(status=400)
         await app.process_update(update)
         return web.Response()
 
