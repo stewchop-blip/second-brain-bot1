@@ -92,7 +92,13 @@ async def main() -> None:
         webhook_url = config.webhook_url
         if webhook_url:
             full_url = f"{webhook_url.rstrip('/')}{config.webhook_path}"
-            await app.bot.set_webhook(url=full_url, secret_token=config.webhook_secret)
+            # NOTE: secret_token must match [A-Za-z0-9_-]; skip if it has
+            # other characters (e.g. dots) to avoid Telegram BadRequest.
+            secret = config.webhook_secret
+            if secret and all(c.isalnum() or c in "-_" for c in secret):
+                await app.bot.set_webhook(url=full_url, secret_token=secret)
+            else:
+                await app.bot.set_webhook(url=full_url)
             logger.info(f"Webhook registered at: {full_url}")
         else:
             logger.warning("WEBHOOK_URL not set — webhook NOT registered.")
